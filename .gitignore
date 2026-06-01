@@ -1,0 +1,7 @@
+﻿*.csv
+logs/
+__pycache__/
+*.pkl
+*.pyc
+.venv/
+mlruns/
