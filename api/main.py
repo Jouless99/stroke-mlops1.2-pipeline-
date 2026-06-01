@@ -1,25 +1,3 @@
-"""
-API REST – Predicción de Stroke
-================================
-Sirve el modelo de clasificación binaria entrenado en el pipeline MLOps.
-
-Endpoints:
-    GET  /           → health check
-    GET  /info       → metadatos del modelo cargado
-    POST /predict    → predice si una persona tendrá un stroke
-    POST /predict/batch → predicción en lote
-
-Documentación interactiva disponible en:
-    http://localhost:8000/docs   (Swagger UI)
-    http://localhost:8000/redoc  (ReDoc)
-
-Para levantar la API:
-    uvicorn main:app --reload --port 8000
-
-Para usar con Docker Compose (repo original):
-    La variable MODEL_PATH puede sobreescribirse con una variable de entorno.
-"""
-
 import os
 import logging
 from typing import Optional, List
@@ -33,7 +11,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 # ── Configuración ─────────────────────────────────────────────────────────────
-# MODIFICAR estas rutas si cambiás la estructura de carpetas.
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH    = os.getenv("MODEL_PATH",    os.path.join(BASE_DIR, "model.pkl"))
 BMI_PATH      = os.getenv("BMI_PATH",      os.path.join(BASE_DIR, "bmi_stats.pkl"))
