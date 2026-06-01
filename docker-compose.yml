@@ -1,0 +1,190 @@
+version: "3.8"
+
+# ─── Variables de entorno compartidas ───────────────────────────────────────
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    # MLflow apunta al servidor del stack
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    # Ruta al CSV dentro del contenedor (montado desde ./data)
+    STROKE_DATA_PATH: /opt/airflow/dags/data/healthcare-dataset-stroke-data.csv
+    ARTIFACTS_DIR: /tmp/stroke_mlops
+    _PIP_ADDITIONAL_REQUIREMENTS: >-
+      scikit-learn==1.4.2
+      xgboost==2.0.3
+      imbalanced-learn==0.12.3
+      pandas==2.2.2
+      numpy==1.26.4
+      joblib==1.4.2
+      mlflow==2.13.0
+      matplotlib==3.9.0
+      seaborn==0.13.2
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./logs/airflow:/opt/airflow/logs
+    - airflow-plugins:/opt/airflow/plugins
+    - artifacts:/tmp/stroke_mlops
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+
+  # ── Base de datos para Airflow ─────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: stroke_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # ── Airflow: inicialización (corre una vez y termina) ──────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: stroke_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /tmp/stroke_mlops && chmod 777 /tmp/stroke_mlops
+        airflow db upgrade
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+    restart: "no"
+
+  # ── Airflow: webserver ─────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: stroke_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Airflow: scheduler ─────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: stroke_airflow_scheduler
+    command: scheduler
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── MinIO (almacenamiento de artefactos MLflow) ────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: stroke_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio_admin
+      MINIO_ROOT_PASSWORD: minio_password
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: always
+
+  # ── Crea el bucket en MinIO al inicio ─────────────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: stroke_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 minio_admin minio_password;
+      mc mb --ignore-existing myminio/mlflow-artifacts;
+      echo 'Bucket mlflow-artifacts creado.';
+      "
+    restart: "no"
+
+  # ── MLflow Tracking Server ─────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    container_name: stroke_mlflow
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minio_admin
+      AWS_SECRET_ACCESS_KEY: minio_password
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root s3://mlflow-artifacts/
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-db:/mlflow
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    restart: always
+    working_dir: /mlflow
+
+  # ── FastAPI: servicio de inferencia ───────────────────────────────────────
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: stroke_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - artifacts:/app/artifacts:ro
+    environment:
+      MODEL_PATH: /app/artifacts/model.pkl
+      BMI_STATS_PATH: /app/artifacts/bmi_stats.pkl
+      FEATURE_NAMES_PATH: /app/artifacts/feature_names.pkl
+    restart: always
+    depends_on:
+      - mlflow
+
+volumes:
+  postgres-db:
+  minio-data:
+  mlflow-db:
+  airflow-plugins:
+  artifacts:
+  logs:
