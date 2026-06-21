@@ -15,6 +15,10 @@ x-airflow-common: &airflow-common
     # Ruta al CSV dentro del contenedor (montado desde ./data)
     STROKE_DATA_PATH: /opt/airflow/dags/data/healthcare-dataset-stroke-data.csv
     ARTIFACTS_DIR: /tmp/stroke_mlops
+    # Credenciales MinIO para que MLflow pueda subir artefactos a S3
+    AWS_ACCESS_KEY_ID: minio_admin
+    AWS_SECRET_ACCESS_KEY: minio_password
+    MLFLOW_S3_ENDPOINT_URL: http://minio:9000
     _PIP_ADDITIONAL_REQUIREMENTS: >-
       scikit-learn==1.4.2
       xgboost==2.0.3
@@ -175,8 +179,8 @@ services:
       - artifacts:/app/artifacts:ro
     environment:
       MODEL_PATH: /app/artifacts/model.pkl
-      BMI_STATS_PATH: /app/artifacts/bmi_stats.pkl
-      FEATURE_NAMES_PATH: /app/artifacts/feature_names.pkl
+      BMI_PATH: /app/artifacts/bmi_stats.pkl
+      FEATURES_PATH: /app/artifacts/feature_names.pkl
     restart: always
     depends_on:
       - mlflow

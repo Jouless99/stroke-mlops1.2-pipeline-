@@ -148,12 +148,11 @@ def preprocess_data(**context) -> None:
     feature_names = X_train.columns.tolist()
     bmi_stats = {"median_bmi_1": m1, "median_bmi_0": m0, "lim_inf": lim_inf, "lim_sup": lim_sup}
 
-    # Balanceo
-    X_full = X_train._append(X_test)
-    y_full = y_train._append(y_test)
+    # Balanceo SOLO sobre train (corrige data leakage)
+    # El test set permanece intacto — no se mezcla con el train antes del balanceo
     rus = RandomUnderSampler(sampling_strategy="majority", random_state=42)
-    X_under, y_under = rus.fit_resample(X_full, y_full)
-    X_tr, X_te, y_tr, y_te = train_test_split(X_under, y_under, test_size=0.25, random_state=43)
+    X_tr, y_tr = rus.fit_resample(X_train, y_train)
+    X_te, y_te = X_test, y_test
 
     # Guardar artefactos
     joblib.dump(X_tr,          f"{ARTIFACTS_DIR}/X_train.pkl")
@@ -311,24 +310,34 @@ def evaluate_model(**context) -> None:
 
 def export_model(**context) -> None:
     """
-    Copia el mejor modelo serializado a la carpeta donde la API FastAPI
-    lo buscará. También copia los artefactos de preprocesamiento necesarios.
+    Copia el mejor modelo serializado al volumen compartido (ARTIFACTS_DIR)
+    donde la API FastAPI lo buscará. También copia los artefactos de
+    preprocesamiento necesarios.
 
-    Nota: En producción, este paso subiría los archivos a un bucket S3/MinIO.
+    El volumen 'artifacts' es compartido entre el contenedor de Airflow
+    y el contenedor de la API, montado en /tmp/stroke_mlops y /app/artifacts
+    respectivamente.
     """
     import shutil
 
-    # Directorio donde la API busca el modelo
-    # MODIFICAR esta ruta si cambiás la ubicación de la API.
-    api_dir = os.path.join(os.path.dirname(DATA_PATH), "..", "..", "api")
-    api_dir = os.path.normpath(api_dir)
-    os.makedirs(api_dir, exist_ok=True)
+    # Los archivos ya están en ARTIFACTS_DIR (/tmp/stroke_mlops)
+    # que es el mismo volumen compartido que lee la API en /app/artifacts
+    # Solo necesitamos renombrar best_model.pkl → model.pkl
+    src = f"{ARTIFACTS_DIR}/best_model.pkl"
+    dst = f"{ARTIFACTS_DIR}/model.pkl"
 
-    for fname in ["best_model.pkl", "bmi_stats.pkl", "feature_names.pkl"]:
-        src = f"{ARTIFACTS_DIR}/{fname}"
-        dst = os.path.join(api_dir, fname.replace("best_model", "model"))
+    if os.path.exists(src):
         shutil.copy2(src, dst)
         logger.info("Exportado: %s → %s", src, dst)
+    else:
+        raise FileNotFoundError(f"Modelo no encontrado en: {src}")
+
+    # Verificar que los artefactos de preprocesamiento también existen
+    for fname in ["bmi_stats.pkl", "feature_names.pkl"]:
+        path = f"{ARTIFACTS_DIR}/{fname}"
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Artefacto no encontrado: {path}")
+        logger.info("Artefacto verificado: %s", path)
 
     logger.info("Pipeline completo. Modelo listo para ser servido por FastAPI.")
 
