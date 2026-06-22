@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 .venv/
 mlruns/
+
+!airflow/dags/data/healthcare-dataset-stroke-data.csv
