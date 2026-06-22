@@ -101,7 +101,14 @@ services:
   airflow-scheduler:
     <<: *airflow-common
     container_name: stroke_airflow_scheduler
-    command: scheduler
+    user: "0:0"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /tmp/stroke_mlops && chmod -R 777 /tmp/stroke_mlops
+        su airflow -c "pip install --no-cache-dir $${_PIP_ADDITIONAL_REQUIREMENTS}"
+        exec su airflow -c "airflow scheduler"
     restart: always
     depends_on:
       <<: *airflow-common-depends-on

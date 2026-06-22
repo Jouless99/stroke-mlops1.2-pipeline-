@@ -10,7 +10,7 @@ Orquesta el ciclo de vida del modelo de predicción de stroke:
     4. evaluate_model  – carga el mejor modelo del experimento MLflow y reporta métricas.
     5. export_model    – serializa el mejor modelo como .pkl para que la API lo consuma.
 
-Modo de ejecución: LOCAL (sin Docker ni servidor MLflow externo).
+Modo de ejecución: Docker (Airflow + MLflow + MinIO + FastAPI).
     - MLflow guarda los runs en  ./mlruns/  relativo al directorio del DAG.
     - Los artefactos intermedios se guardan en /tmp/stroke_mlops/.
 
@@ -181,7 +181,7 @@ def train_model(**context) -> None:
     from mlflow.models.signature import infer_signature
     from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
     from sklearn.ensemble import RandomForestClassifier, VotingClassifier
-    from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+    from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, classification_report
     from xgboost import XGBClassifier
 
     X_train = joblib.load(f"{ARTIFACTS_DIR}/X_train.pkl")
@@ -236,15 +236,34 @@ def train_model(**context) -> None:
             y_pred  = search.predict(X_test)
             y_proba = search.predict_proba(X_test)[:, 1]
 
+            # Métricas globales
+            report_dict = classification_report(y_test, y_pred, output_dict=True)
             metrics = {
-                "roc_auc" : round(roc_auc_score(y_test, y_proba), 4),
-                "f1_score": round(f1_score(y_test, y_pred), 4),
-                "accuracy": round(accuracy_score(y_test, y_pred), 4),
+                "roc_auc"          : round(roc_auc_score(y_test, y_proba), 4),
+                "f1_score"         : round(f1_score(y_test, y_pred), 4),
+                "accuracy"         : round(accuracy_score(y_test, y_pred), 4),
+                # Métricas por clase (stroke = clase 1)
+                "precision_stroke" : round(report_dict["1"]["precision"], 4),
+                "recall_stroke"    : round(report_dict["1"]["recall"], 4),
+                "f1_stroke"        : round(report_dict["1"]["f1-score"], 4),
+                "precision_no_stroke": round(report_dict["0"]["precision"], 4),
+                "recall_no_stroke" : round(report_dict["0"]["recall"], 4),
             }
-            mlflow.log_params(c["params"])
+            # Registrar mejores parámetros encontrados por RandomizedSearchCV
+            mlflow.log_params(search.best_params_)
             mlflow.log_metrics(metrics)
             mlflow.set_tag("model_type", c["name"])
             mlflow.set_tag("features", str(feature_names))
+
+            # Guardar matriz de confusión como imagen
+            import matplotlib.pyplot as plt
+            from sklearn.metrics import ConfusionMatrixDisplay
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ConfusionMatrixDisplay.from_predictions(y_test, y_pred, ax=ax,
+                display_labels=["No Stroke", "Stroke"])
+            ax.set_title(f"Matriz de Confusión - {c['name']}")
+            mlflow.log_figure(fig, f"confusion_matrix_{c['name'].replace(' ', '_')}.png")
+            plt.close(fig)
 
             sig = infer_signature(X_train, search.predict(X_train))
             mlflow.sklearn.log_model(search, "model", signature=sig)
@@ -267,8 +286,39 @@ def train_model(**context) -> None:
         y_pred  = ensemble.predict(X_test)
         y_proba = ensemble.predict_proba(X_test)[:, 1]
         auc     = round(roc_auc_score(y_test, y_proba), 4)
-        mlflow.log_metrics({"roc_auc": auc, "f1_score": round(f1_score(y_test, y_pred), 4)})
+
+        report_dict = classification_report(y_test, y_pred, output_dict=True)
+        ensemble_metrics = {
+            "roc_auc"          : auc,
+            "f1_score"         : round(f1_score(y_test, y_pred), 4),
+            "accuracy"         : round(accuracy_score(y_test, y_pred), 4),
+            "precision_stroke" : round(report_dict["1"]["precision"], 4),
+            "recall_stroke"    : round(report_dict["1"]["recall"], 4),
+            "f1_stroke"        : round(report_dict["1"]["f1-score"], 4),
+            "precision_no_stroke": round(report_dict["0"]["precision"], 4),
+            "recall_no_stroke" : round(report_dict["0"]["recall"], 4),
+        }
+        # Parámetros de los modelos base del ensamble
+        mlflow.log_params({
+            "rf_best_n_estimators": trained["Random Forest"].best_params_.get("n_estimators"),
+            "rf_best_max_depth"   : trained["Random Forest"].best_params_.get("max_depth"),
+            "xgb_best_n_estimators": trained["XGBoost"].best_params_.get("n_estimators"),
+            "xgb_best_learning_rate": trained["XGBoost"].best_params_.get("learning_rate"),
+            "voting"              : "soft",
+        })
+        mlflow.log_metrics(ensemble_metrics)
         mlflow.set_tag("model_type", "Ensemble RF+XGB")
+
+        # Matriz de confusión del ensamble
+        import matplotlib.pyplot as plt
+        from sklearn.metrics import ConfusionMatrixDisplay
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ConfusionMatrixDisplay.from_predictions(y_test, y_pred, ax=ax,
+            display_labels=["No Stroke", "Stroke"])
+        ax.set_title("Matriz de Confusión - Ensemble RF+XGB")
+        mlflow.log_figure(fig, "confusion_matrix_Ensemble.png")
+        plt.close(fig)
+
         mlflow.sklearn.log_model(ensemble, "model")
 
         if auc > best_auc:
@@ -304,7 +354,7 @@ def evaluate_model(**context) -> None:
     mlflow.set_tracking_uri(MLFLOW_URI)
     mlflow.set_experiment(EXPERIMENT)
     with mlflow.start_run(run_name="Evaluacion Final"):
-        mlflow.log_metric("final_roc_auc", auc)
+        mlflow.log_metric("roc_auc", auc)
         mlflow.log_text(report, "classification_report.txt")
 
 

@@ -10,14 +10,14 @@
 
 El accidente cerebrovascular (stroke) es la segunda causa de muerte a nivel mundial. Este proyecto implementa un pipeline de MLOps completo para predecir el **riesgo de stroke** de un paciente a partir de variables clínicas y demográficas.
 
-El modelo entrenado clasifica si un paciente sufrirá un stroke (clase 1) o no (clase 0), usando un **ensamble de Soft Voting** entre Random Forest y XGBoost, elegido como mejor modelo por ROC-AUC.
+El modelo entrenado clasifica si un paciente sufrirá un stroke (clase 1) o no (clase 0). El pipeline entrena tres candidatos —Random Forest, XGBoost y un **Ensamble de Soft Voting** entre ambos— y selecciona automáticamente como modelo de producción al que obtenga mejor ROC-AUC en cada corrida.
 
 ---
 
 ## Arquitectura del Proyecto
 
 ```
-stroke_mlops/
+stroke_mlops_final/
 ├── airflow/
 │   └── dags/
 │       ├── stroke_pipeline_dag.py   # DAG principal (5 etapas)
@@ -80,7 +80,7 @@ validate_data → preprocess_data → train_model → evaluate_model → export_
 
 ```bash
 git clone <URL_DEL_REPOSITORIO>
-cd stroke_mlops
+cd stroke_mlops_final
 ```
 
 ### 2. Verificar que el dataset está en su lugar
@@ -103,12 +103,16 @@ Este comando levanta todos los servicios:
 - MinIO Console → http://localhost:9001 (usuario: `minio_admin`, contraseña: `minio_password`)
 - API FastAPI → http://localhost:8000
 
-Esperar ~2 minutos para que todos los servicios inicialicen correctamente.
+Esperar varios minutos para que todos los servicios inicialicen correctamente (ver nota más abajo sobre por qué el arranque puede tardar).
 
 ```bash
 # Verificar que todos los servicios están corriendo
 docker compose ps
 ```
+
+> **Nota sobre permisos del volumen compartido:** el servicio `airflow-scheduler` arranca como `root` y ejecuta automáticamente `chmod -R 777 /tmp/stroke_mlops` antes de iniciar Airflow (ver `command` en `docker-compose.yml`). Esto asegura que el volumen `artifacts`, compartido entre Airflow y la API, tenga los permisos correctos en cada `docker compose up`, sin necesidad de ningún paso manual adicional.
+>
+> **Nota sobre el tiempo de arranque del scheduler:** como el mismo `command` reemplaza el entrypoint original de la imagen de Airflow, las dependencias de `_PIP_ADDITIONAL_REQUIREMENTS` (scikit-learn, XGBoost, MLflow, etc.) se instalan explícitamente en cada arranque del contenedor (no quedan persistidas en la imagen). La instalación corre como el usuario `airflow` (vía `su airflow -c "..."`), ya que `pip` falla silenciosamente si detecta que se ejecuta como `root`. El paquete `xgboost` pesa cerca de 300 MB, así que el scheduler puede tardar **varios minutos en estar listo** (el tiempo depende de la velocidad de conexión a internet). Se recomienda esperar a que `docker logs stroke_airflow_scheduler` muestre `Starting the scheduler` antes de disparar el DAG — si se dispara antes de tiempo, las tasks pueden fallar con `ModuleNotFoundError` y Airflow las reintentará automáticamente una vez (`retries: 1`).
 
 ### 4. Ejecutar el Pipeline
 
@@ -203,8 +207,12 @@ Los experimentos se guardarán localmente en `notebooks/mlruns/`.
 |---|---|---|
 | `STROKE_DATA_PATH` | Ruta al CSV dentro del contenedor | `/opt/airflow/dags/data/...` |
 | `MLFLOW_TRACKING_URI` | URI del servidor MLflow | `http://mlflow:5000` |
-| `ARTIFACTS_DIR` | Directorio de artefactos intermedios | `/tmp/stroke_mlops` |
-| `MODEL_PATH` | Ruta al modelo en la API | `/app/artifacts/model.pkl` |
+| `ARTIFACTS_DIR` | Directorio de artefactos intermedios (lado Airflow) | `/tmp/stroke_mlops` |
+| `MODEL_PATH` | Ruta al modelo serializado, leída por la API | `/app/artifacts/model.pkl` |
+| `BMI_PATH` | Ruta al diccionario de estadísticas de BMI, leída por la API | `/app/artifacts/bmi_stats.pkl` |
+| `FEATURES_PATH` | Ruta a la lista de features del modelo, leída por la API | `/app/artifacts/feature_names.pkl` |
+
+> **Importante:** `ARTIFACTS_DIR` (lado Airflow) y las variables `MODEL_PATH` / `BMI_PATH` / `FEATURES_PATH` (lado API) apuntan al mismo volumen Docker compartido (`artifacts`), pero montado en rutas distintas dentro de cada contenedor (`/tmp/stroke_mlops` vs `/app/artifacts`). Si se renombran los archivos en `export_model` (DAG) hay que mantener la correspondencia exacta con los nombres que espera `api/main.py`.
 
 ---
 
@@ -223,12 +231,14 @@ El pipeline replica la metodología del trabajo original de AMq1:
 
 ## Resultados del Modelo
 
-Los tres modelos entrenados y sus métricas típicas (pueden variar entre runs):
+El pipeline entrena Random Forest, XGBoost y un Ensamble de Soft Voting entre ambos, y **selecciona automáticamente como modelo de producción al que obtiene mejor ROC-AUC sobre el set de test**, sin asumir de antemano cuál ganará. Esto significa que el modelo servido por la API puede variar entre corridas, según el resultado real de cada entrenamiento.
 
-| Modelo | ROC-AUC | F1-Score | Accuracy |
-|---|---|---|---|
-| Random Forest | ~0.84 | ~0.77 | ~0.79 |
-| XGBoost | ~0.85 | ~0.78 | ~0.80 |
-| **Ensamble RF+XGB** | **~0.86** | **~0.79** | **~0.81** |
+Resultados de una corrida de referencia (las métricas varían levemente entre ejecuciones por la búsqueda de hiperparámetros y el split de datos):
 
-El **ensamble de Soft Voting** es seleccionado automáticamente como modelo de producción.
+| Modelo | ROC-AUC | 
+|---|---|
+| Random Forest | 0.8369 |
+| **XGBoost** | **0.8482** |
+| Ensamble RF+XGB | 0.8444 |
+
+En esta corrida, **XGBoost individual** superó levemente al Ensamble y quedó seleccionado como `best_model.pkl`. El endpoint `GET /info` de la API permite verificar en cualquier momento qué modelo está efectivamente cargado en producción (campo `model_type`).
